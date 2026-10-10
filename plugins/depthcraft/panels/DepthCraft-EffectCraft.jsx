@@ -4,7 +4,8 @@
 // budget) and scripts cannot launch programs, but scripts can open TCP sockets. This panel talks to
 // the local `depthcraft-cli serve` program, which keeps the model loaded and writes the depth map.
 //
-//   1. Start the server once:  run Start-DepthCraft-Server.bat (or: depthcraft-cli.exe serve)
+//   1. Start the server once:  python depthcraft_server.py   (any OS; pip install onnxruntime numpy pillow)
+//                              or on Windows with the zip: Start-DepthCraft-Server.bat
 //   2. Preferences > Scripting & Expressions > Allow Scripts to Write Files and Access Network: ON
 //   3. Install DepthCraft-EffectCraft.jsx with File > Scripts > Install ScriptUI Panel..., open it from the Window menu.
 //   4. Select a footage layer and press Render Depth. The depth map is imported and added as a layer
@@ -68,7 +69,7 @@
 
   var bar = ui.add("progressbar", undefined, 0, 100);
   bar.preferredSize.width = 260;
-  var status = ui.add("statictext", undefined, "Start the server (Start-DepthCraft-Server.bat), then Render Depth.", { name: "status" });
+  var status = ui.add("statictext", undefined, "Start the server (python depthcraft_server.py), then Render Depth.", { name: "status" });
   status.characters = 40;
 
   function say(text) {
@@ -97,7 +98,7 @@
     s.encoding = "UTF-8";
     s.timeout = 600;
     if (!s.open(HOST, "UTF-8")) {
-      say("Server not running. Start Start-DepthCraft-Server.bat (and allow script network access).");
+      say("Server not running. Start it: python depthcraft_server.py (and allow script network access).");
       return null;
     }
     return s;

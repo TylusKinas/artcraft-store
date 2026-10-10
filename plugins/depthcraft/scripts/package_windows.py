@@ -23,6 +23,8 @@ WHAT IS IN THIS FOLDER
   depthcraft-cli.exe, *.dll       The depth engine (Depth Anything V3 Small, built in). Runs on your CPU, or on a
                                   DirectX 12 GPU with --device gpu. Keep the .dll files next to the .exe.
   Start-DepthCraft-Server.bat     EffectCraft only: starts the engine and keeps it ready (see below).
+  depthcraft_server.py            The same server as one Python file (Windows/macOS/Linux): pip install onnxruntime
+                                  numpy pillow, then python depthcraft_server.py. Use it instead of the .exe/.bat if you like.
   EffectCraft\DepthCraft-EffectCraft.jsx   EffectCraft panel: "Render Depth" button.
   EffectCraft\depthcraft.wasm              EffectCraft effect: colorize / fog / slice / cutout a depth map.
   AfterEffects\DepthCraft-AfterEffects.jsx  Adobe After Effects panel (no server needed).
@@ -79,6 +81,7 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
     z.writestr(top + "ONNXRuntime-LICENSE.txt", ort.read("LICENSE"))
     z.writestr(top + "DirectML-LICENSE.txt", dml.read("LICENSE.txt"))
     z.write(root / "panels/Start-DepthCraft-Server.bat", top + "Start-DepthCraft-Server.bat")
+    z.write(root / "panels/depthcraft_server.py", top + "depthcraft_server.py")
     z.write(root / "panels/DepthCraft-EffectCraft.jsx", top + "EffectCraft/DepthCraft-EffectCraft.jsx")
     z.write(wasm, top + "EffectCraft/depthcraft.wasm")
     z.write(root / "panels/DepthCraft-AfterEffects.jsx", top + "AfterEffects/DepthCraft-AfterEffects.jsx")
