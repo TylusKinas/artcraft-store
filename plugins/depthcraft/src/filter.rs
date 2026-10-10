@@ -21,88 +21,71 @@ pub fn remap_depth(raw: f32, near: f32, far: f32, invert: bool, gamma: f32) -> f
     val.clamp(0.0, 1.0)
 }
 
-/// Fast 5x5 cross-bilateral filter that refines depth edges using image luminance guidance.
-/// Aligns depth boundaries with object contours, preventing depth bleed.
+/// Cross-bilateral filter that refines depth edges using image RGB guidance (see
+/// [`refine_depth_guided`]). Aligns depth boundaries with object contours, preventing depth bleed.
 pub fn refine_depth_edges(depth: &[f32], rgb: &[[f32; 3]], width: usize, height: usize, radius: usize, out: &mut [f32]) {
-    if width == 0 || height == 0 || depth.len() < width * height || rgb.len() < width * height || out.len() < width * height {
+    if rgb.len() < width * height {
         return;
     }
+    let lum: Vec<f32> = rgb.iter().take(width * height).map(|c| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]).collect();
+    refine_depth_guided(depth, &lum, width, height, radius, out);
+}
 
+/// Bilateral filter of `depth` guided by a luminance plane (`guide`; the depth itself for a depth layer).
+///
+/// Cost is bounded for hosts that meter instructions (EffectCraft gives wasm plug-ins a fuel budget
+/// per pixel): weights come from lookup tables instead of `exp`, radius is capped at 3 (49 taps).
+pub fn refine_depth_guided(depth: &[f32], guide: &[f32], width: usize, height: usize, radius: usize, out: &mut [f32]) {
+    let n = width * height;
+    if width == 0 || height == 0 || depth.len() < n || guide.len() < n || out.len() < n {
+        return;
+    }
     if radius == 0 {
-        out[..width * height].copy_from_slice(&depth[..width * height]);
+        out[..n].copy_from_slice(&depth[..n]);
         return;
     }
 
-    let r = radius.min(4) as isize;
+    let r = radius.min(3);
+    let side = 2 * r + 1;
     let spatial_sigma = (r as f32) * 0.75;
-    let inv_spatial_2sigma2 = 1.0 / (2.0 * spatial_sigma * spatial_sigma).max(1e-4);
-    let range_sigma = 0.15f32;
-    let inv_range_2sigma2 = 1.0 / (2.0 * range_sigma * range_sigma);
+    let inv_spatial = 1.0 / (2.0 * spatial_sigma * spatial_sigma).max(1e-4);
+    let mut spatial = [0.0f32; 49];
+    for dy in 0..side {
+        for dx in 0..side {
+            let (ox, oy) = (dx as f32 - r as f32, dy as f32 - r as f32);
+            spatial[dy * side + dx] = (-(ox * ox + oy * oy) * inv_spatial).exp();
+        }
+    }
+    // Range weight by |luminance difference| quantised to 1/128.
+    let inv_range = 1.0 / (2.0 * 0.15f32 * 0.15f32);
+    let mut range = [0.0f32; 130];
+    for (i, w) in range.iter_mut().enumerate() {
+        let d = i as f32 / 128.0;
+        *w = (-d * d * inv_range).exp();
+    }
 
     for y in 0..height {
-        let y_isize = y as isize;
-        let row_start = y * width;
-
+        let y0 = y.saturating_sub(r);
+        let y1 = (y + r).min(height - 1);
         for x in 0..width {
-            let x_isize = x as isize;
-            let center_idx = row_start + x;
-
-            let center_rgb = match rgb.get(center_idx) {
-                Some(c) => *c,
-                None => continue,
-            };
-            let center_lum = 0.2126 * center_rgb[0] + 0.7152 * center_rgb[1] + 0.0722 * center_rgb[2];
-            let center_d = match depth.get(center_idx) {
-                Some(d) => *d,
-                None => continue,
-            };
-
-            let mut sum_weight = 0.0f32;
-            let mut sum_depth = 0.0f32;
-
-            for dy in -r..=r {
-                let ny = y_isize + dy;
-                if ny < 0 || ny >= height as isize {
-                    continue;
-                }
-                let ny_idx = (ny as usize) * width;
-
-                for dx in -r..=r {
-                    let nx = x_isize + dx;
-                    if nx < 0 || nx >= width as isize {
-                        continue;
-                    }
-                    let neighbor_idx = ny_idx + (nx as usize);
-
-                    let n_rgb = match rgb.get(neighbor_idx) {
-                        Some(c) => *c,
-                        None => continue,
-                    };
-                    let n_lum = 0.2126 * n_rgb[0] + 0.7152 * n_rgb[1] + 0.0722 * n_rgb[2];
-                    let n_d = match depth.get(neighbor_idx) {
-                        Some(d) => *d,
-                        None => continue,
-                    };
-
-                    let spatial_dist_sq = (dx * dx + dy * dy) as f32;
-                    let lum_diff = (n_lum - center_lum).abs();
-
-                    let spatial_w = (-spatial_dist_sq * inv_spatial_2sigma2).exp();
-                    let range_w = (-lum_diff * lum_diff * inv_range_2sigma2).exp();
-                    let w = spatial_w * range_w;
-
-                    sum_weight += w;
-                    sum_depth += w * n_d;
+            let x0 = x.saturating_sub(r);
+            let x1 = (x + r).min(width - 1);
+            let c_idx = y * width + x;
+            let cg = guide[c_idx];
+            let mut sw = 0.0f32;
+            let mut sd = 0.0f32;
+            for ny in y0..=y1 {
+                let s_row = (ny + r - y) * side + r;
+                let row = ny * width;
+                for nx in x0..=x1 {
+                    let i = row + nx;
+                    let q = (((guide[i] - cg).abs() * 128.0) as usize).min(129);
+                    let w = spatial[s_row + nx - x] * range[q];
+                    sw += w;
+                    sd += w * depth[i];
                 }
             }
-
-            if sum_weight > 1e-6 {
-                if let Some(target) = out.get_mut(center_idx) {
-                    *target = sum_depth / sum_weight;
-                }
-            } else if let Some(target) = out.get_mut(center_idx) {
-                *target = center_d;
-            }
+            out[c_idx] = if sw > 1e-6 { sd / sw } else { depth[c_idx] };
         }
     }
 }

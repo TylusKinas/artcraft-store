@@ -15,10 +15,23 @@ crate-type = ["cdylib", "rlib"]
 [[bin]]
 name = "depthcraft-cli"
 path = "src/main.rs"
+required-features = ["onnx"]
+
+[features]
+# Native ONNX Runtime inference (CPU + GPU execution providers). Never enabled for the wasm build.
+onnx = ["dep:ort", "dep:image", "dep:ndarray"]
+# Compile the 8-bit model into depthcraft-cli (single executable, no separate .onnx).
+embed-model = ["onnx"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `load-dynamic`: use the user's onnxruntime shared library (ORT_DYLIB_PATH), so a GPU-enabled
+# build of ONNX Runtime (CUDA / DirectML / CoreML) is picked up without bundling binaries.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic", "cuda", "tensorrt", "directml", "coreml"], optional = true }
+ndarray = { version = "0.17", optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
+
 
 [profile.release]
 opt-level = "s"

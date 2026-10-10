@@ -1,31 +1,34 @@
-//! Openly-licensed monocular depth estimation model registry, license documentation, and verification.
+//! Depth model registry, license documentation, and weight verification.
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceSelection {
+    /// Always works, slower.
     Cpu,
+    /// CUDA / DirectML / CoreML through ONNX Runtime, much faster. Errors if no GPU provider is present.
     Gpu,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QualityPreset {
-    Fast,     // 256x256 inference resolution
-    Balanced, // 384x384 inference resolution
-    Ultra,    // 512x512 inference resolution
+    Fast,     // long side 252 px
+    Balanced, // long side 364 px
+    Ultra,    // long side 518 px (native Depth Anything resolution)
 }
 
 impl QualityPreset {
-    pub fn resolution(&self) -> (usize, usize) {
+    /// Inference long side in pixels (multiples of the 14 px ViT patch).
+    pub fn long_side(&self) -> usize {
         match self {
-            QualityPreset::Fast => (256, 256),
-            QualityPreset::Balanced => (384, 384),
-            QualityPreset::Ultra => (512, 512),
+            QualityPreset::Fast => 252,
+            QualityPreset::Balanced => 364,
+            QualityPreset::Ultra => 518,
         }
     }
 }
 
-/// Metadata describing a supported depth estimation model.
+/// Metadata describing the supported depth estimation model.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ModelSpec {
     pub id: &'static str,
@@ -35,48 +38,24 @@ pub struct ModelSpec {
     pub license: &'static str,
     pub license_url: &'static str,
     pub homepage: &'static str,
-    pub default_resolution: (usize, usize),
-    pub weights_file: &'static str,
-    pub sha256: &'static str,
+    /// Where the ONNX export is published.
+    pub weights_url: &'static str,
+    /// Pinned SHA-256 of the ONNX file (`None` = unpinned).
+    pub sha256: Option<&'static str>,
 }
 
 /// The registry of supported depth estimation models.
 pub const MODELS: &[ModelSpec] = &[
     ModelSpec {
-        id: "classical",
-        name: "Classical Gradient & Focus Proxy",
-        description: "Pure-Rust multi-scale edge gradient and focus depth estimator. Zero external weights, deterministic, runs in sandboxed wasm and CPU.",
-        authors: "EffectCraft contributors",
-        license: "MIT OR Apache-2.0",
-        license_url: "https://github.com/storytold/effectcraft/blob/main/LICENSE-MIT",
-        homepage: "https://github.com/storytold/effectcraft",
-        default_resolution: (256, 256),
-        weights_file: "embedded",
-        sha256: "builtin",
-    },
-    ModelSpec {
-        id: "midas_v21_small",
-        name: "MiDaS v2.1 Small",
-        description: "Efficient monocular depth estimation network (René Ranftl et al., Intel ISL, 2021). Optimized for fast edge and relative depth recovery.",
-        authors: "René Ranftl, Katrin Lasinger, David Hafner, Konrad Schindler, Vladlen Koltun (Intel ISL)",
-        license: "MIT",
-        license_url: "https://github.com/isl-org/MiDaS/blob/master/LICENSE",
-        homepage: "https://github.com/isl-org/MiDaS",
-        default_resolution: (256, 256),
-        weights_file: "midas_v21_small.tflite",
-        sha256: "8e98da69b0faee2496a8435d8bc1b29a656ea9c20a8f88cf50fca1b942079075",
-    },
-    ModelSpec {
-        id: "depth_anything_v2_small",
-        name: "Depth Anything V2 Small",
-        description: "Vision Transformer-based monocular depth estimation model trained on synthetic and large-scale real data (Lihe Yang et al., 2024).",
-        authors: "Lihe Yang, Bingyi Kang, Zilong Huang, Xiaogang Xu, Jiashi Feng, Hengshuang Zhao (HKU & TikTok)",
-        license: "Apache-2.0",
-        license_url: "https://github.com/DepthAnything/Depth-Anything-V2/blob/main/LICENSE",
-        homepage: "https://github.com/DepthAnything/Depth-Anything-V2",
-        default_resolution: (518, 518),
-        weights_file: "depth_anything_v2_vits.tflite",
-        sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    id: "depth_anything_v3_small",
+    name: "Depth Anything V3 Small (8-bit ONNX)",
+    description: "Depth Anything V3 Small, 8-bit dynamically quantised ONNX export (en970/onnx-community, 27.6 MB, Pearson r >= 0.99 vs float32). Runs on CPU, or on GPU through ONNX Runtime execution providers.",
+    authors: "ByteDance Seed, Depth Anything 3 team (ONNX export: en970)",
+    license: "Apache-2.0",
+    license_url: "https://github.com/ByteDance-Seed/Depth-Anything-3/blob/main/LICENSE",
+    homepage: "https://github.com/ByteDance-Seed/Depth-Anything-3",
+    weights_url: "https://huggingface.co/en970/depth-anything-v3-small-onnx",
+    sha256: Some("b6eaf064414e1474c88ca58cdafe414771e058996b99ea58e694e256e8738b43"),
     },
 ];
 
@@ -84,14 +63,15 @@ pub fn find_model(id: &str) -> Option<&'static ModelSpec> {
     MODELS.iter().find(|m| m.id == id)
 }
 
-/// Verify that an external weights buffer matches the model's pinned SHA-256.
-pub fn verify_weights(model: &ModelSpec, bytes: &[u8]) -> Result<(), String> {
-    if model.sha256 == "builtin" {
+/// Verify a weights buffer against `expected` (or the model's pinned SHA-256 when `None`).
+/// With nothing to compare against this succeeds; callers should surface the computed hash.
+pub fn verify_weights(model: &ModelSpec, bytes: &[u8], expected: Option<&str>) -> Result<(), String> {
+    let Some(want) = expected.or(model.sha256) else {
         return Ok(());
-    }
-    let calculated = sha256_hex(bytes);
-    if calculated != model.sha256 {
-        return Err(format!("model `{}` checksum mismatch: expected {}, got {}", model.id, model.sha256, calculated));
+    };
+    let got = sha256_hex(bytes);
+    if !got.eq_ignore_ascii_case(want) {
+        return Err(format!("model `{}` checksum mismatch: expected {want}, got {got}", model.id));
     }
     Ok(())
 }
@@ -154,3 +134,6 @@ pub fn sha256_hex(data: &[u8]) -> String {
     }
     out
 }
+
+/// The 8-bit Depth Anything model compiled into `depthcraft-cli` (feature `embed-model`).
+pub const EMBEDDED_MODEL_ID: &str = "depth_anything_v3_small";

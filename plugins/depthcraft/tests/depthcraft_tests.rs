@@ -1,5 +1,6 @@
 use depthcraft::filter::{blend_fog, depth_slice_highlight, refine_depth_edges, remap_depth, turbo_colormap};
-use depthcraft::models::{MODELS, find_model, verify_weights};
+use depthcraft::estimator::{DepthEstimator, inference_size, normalize_depth, resize_plane, to_nchw_normalized};
+use depthcraft::models::{MODELS, find_model, sha256_hex, verify_weights};
 use depthcraft::pipeline::{CancellationToken, DepthPipeline, PipelineConfig};
 use depthcraft::temporal::{apply_temporal_smoothing, reset_temporal_state};
 use depthcraft::{MANIFEST, ec_alloc, ec_api_version, ec_manifest_len, ec_manifest_ptr, render_frame};
@@ -27,7 +28,7 @@ fn test_manifest_is_valid_json() {
     assert_eq!(parsed["category"], "Stylize");
 
     let params = parsed["params"].as_array().expect("params must be array");
-    assert_eq!(params.len(), 11);
+    assert_eq!(params.len(), 13);
 
     let param_ids: Vec<&str> = params.iter().map(|p| p["id"].as_str().unwrap()).collect();
     assert!(param_ids.contains(&"mode"));
@@ -38,7 +39,8 @@ fn test_manifest_is_valid_json() {
     assert!(param_ids.contains(&"temporal_smooth"));
     assert!(param_ids.contains(&"edge_refine"));
     assert!(param_ids.contains(&"fog_density"));
-    assert!(param_ids.contains(&"fog_color"));
+    assert!(param_ids.contains(&"fog_r") && param_ids.contains(&"fog_g") && param_ids.contains(&"fog_b"));
+    assert!(params.iter().all(|p| p["type"] != "color"), "every param must be one scalar slot");
     assert!(param_ids.contains(&"slice_center"));
     assert!(param_ids.contains(&"slice_width"));
 }
@@ -159,41 +161,71 @@ fn test_turbo_colormap_and_modes() {
 
 #[test]
 fn test_models_registry_and_verification() {
-    assert!(MODELS.len() >= 3);
-    for m in MODELS {
-        assert!(!m.id.is_empty());
-        assert!(!m.name.is_empty());
-        assert!(!m.authors.is_empty());
-        assert!(!m.license.is_empty());
-        assert!(m.license_url.starts_with("https://"));
-        assert!(m.homepage.starts_with("https://"));
+    assert_eq!(MODELS.len(), 1, "only Depth Anything V3 Small is supported");
+    let m = find_model("depth_anything_v3_small").expect("DA3 small must exist");
+    assert!(m.weights_url.contains("en970/depth-anything-v3-small-onnx"));
+    assert!(m.license_url.starts_with("https://") && m.homepage.starts_with("https://"));
+    assert!(find_model("classical").is_none());
+
+    // The pinned hash is enforced by default; an explicit hash overrides it.
+    assert_eq!(m.sha256.map(str::len), Some(64));
+    assert!(verify_weights(m, b"any bytes", None).is_err());
+    assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert!(verify_weights(m, b"abc", Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")).is_ok());
+    assert!(verify_weights(m, b"abd", Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")).is_err());
+}
+
+#[test]
+fn test_estimator_pre_and_post_processing() {
+    let (w, h) = inference_size(1920, 1080, 518);
+    assert_eq!(w % 14, 0);
+    assert_eq!(h % 14, 0);
+    assert_eq!(w, 518);
+    assert!(h < w);
+
+    let resized = resize_plane(&[0.0, 1.0, 0.0, 1.0], 2, 2, 4, 4);
+    assert_eq!(resized.len(), 16);
+    assert!(resized.iter().all(|v| (0.0..=1.0).contains(v)));
+
+    let t = to_nchw_normalized(&vec![[0.485, 0.456, 0.406]; 4], 2, 2, 28, 28);
+    assert_eq!(t.len(), 3 * 28 * 28);
+    assert!(t.iter().all(|v| v.abs() < 1e-4), "mean color normalises to zero");
+
+    let mut d = vec![2.0, 4.0, f32::NAN, 6.0];
+    normalize_depth(&mut d);
+    assert!(d.iter().all(|v| (0.0..=1.0).contains(v)));
+    assert_eq!(d.iter().cloned().fold(f32::INFINITY, f32::min), 0.0);
+    assert_eq!(d.iter().cloned().fold(f32::NEG_INFINITY, f32::max), 1.0);
+
+    let mut flat = vec![3.0; 4];
+    normalize_depth(&mut flat);
+    assert_eq!(flat, vec![0.0; 4]);
+}
+
+/// Deterministic stand-in backend: depth grows with the row index.
+struct RowEstimator;
+
+impl DepthEstimator for RowEstimator {
+    fn id(&self) -> &str {
+        "row_test"
     }
 
-    let classical = find_model("classical").expect("classical model must exist");
-    assert!(verify_weights(classical, b"any bytes").is_ok());
-
-    let midas = find_model("midas_v21_small").expect("midas model must exist");
-    assert_eq!(midas.license, "MIT");
-    assert!(verify_weights(midas, b"wrong bytes").is_err());
+    fn estimate(&mut self, _rgb: &[[f32; 3]], width: usize, height: usize) -> Result<Vec<f32>, String> {
+        Ok((0..width * height).map(|i| (i / width) as f32 / height as f32).collect())
+    }
 }
 
 #[test]
 fn test_pipeline_caching_and_cancellation() {
-    let config = PipelineConfig {
-        model_id: "classical".to_string(),
-        quality: depthcraft::models::QualityPreset::Fast,
-        edge_refine_radius: 1,
-        temporal_smooth_weight: 0.0,
-        memory_limit_bytes: 1024 * 1024,
-    };
-    let mut pipeline = DepthPipeline::new(config);
+    let config = PipelineConfig { edge_refine_radius: 1, temporal_smooth_weight: 0.0, memory_limit_bytes: 1024 * 1024 };
+    let mut pipeline = DepthPipeline::new(RowEstimator, config);
 
     let frame = vec![[0.5f32; 3]; 16 * 16];
-    let (d1, hit1) = pipeline.process_frame(&frame, 16, 16);
+    let (d1, hit1) = pipeline.process_frame(&frame, 16, 16).unwrap();
     assert!(!hit1, "first call should be a cache miss");
     assert_eq!(d1.len(), 256);
 
-    let (d2, hit2) = pipeline.process_frame(&frame, 16, 16);
+    let (d2, hit2) = pipeline.process_frame(&frame, 16, 16).unwrap();
     assert!(hit2, "second call with identical frame should be a cache hit");
     assert_eq!(d1, d2);
 
@@ -210,7 +242,7 @@ fn test_pipeline_caching_and_cancellation() {
 fn test_render_frame_execution() {
     let width = 8;
     let height = 8;
-    let nparams = 14;
+    let nparams = 13;
 
     let mut params = vec![0.0f64; nparams];
     params[0] = 0.0; // Mode: Grayscale Depth
@@ -221,12 +253,11 @@ fn test_render_frame_execution() {
     params[5] = 0.0; // Temporal smooth: 0
     params[6] = 1.0; // Edge refine: 1
     params[7] = 50.0; // Fog density: 50
-    params[8] = 0.8; // Fog color R
-    params[9] = 0.85; // Fog color G
-    params[10] = 0.9; // Fog color B
-    params[11] = 1.0; // Fog color A
-    params[12] = 50.0; // Slice center
-    params[13] = 20.0; // Slice width
+    params[8] = 80.0; // Fog R
+    params[9] = 85.0; // Fog G
+    params[10] = 90.0; // Fog B
+    params[11] = 50.0; // Slice center
+    params[12] = 20.0; // Slice width
 
     let mut pixels = vec![[0.0f32; 4]; width * height];
     for (i, px) in pixels.iter_mut().enumerate() {
@@ -237,10 +268,20 @@ fn test_render_frame_execution() {
     let ret = render_frame(&mut pixels, width, height, &params, 0.0);
     assert!(ret.is_ok(), "render_frame should succeed");
 
-    // Pixels should now be grayscale depth map
+    // Input layer is treated as the depth map: output stays a depth map
     for px in pixels.iter() {
         assert_eq!(px[0], px[1], "grayscale mode must have R == G");
         assert_eq!(px[1], px[2], "grayscale mode must have G == B");
         assert_eq!(px[3], 1.0, "alpha should be preserved");
     }
+}
+
+
+#[test]
+fn test_render_accepts_one_value_per_manifest_param() {
+    // Hosts pass nparams == manifest params; a short list must still render (defaults fill the rest).
+    let mut pixels = vec![[0.5f32, 0.5, 0.5, 1.0]; 16];
+    assert!(render_frame(&mut pixels, 4, 4, &[0.0], 0.0).is_ok());
+    assert!(render_frame(&mut pixels, 4, 4, &[0.0; 13], 0.0).is_ok());
+    assert!(render_frame(&mut pixels, 4, 4, &[], 0.0).is_err());
 }
