@@ -362,7 +362,7 @@
       "name": "DepthCraft",
       "version": "0.1.0",
       "author": "ArtCraft Store community",
-      "description": "Monocular depth estimation, edge-preserving bilateral filtering, and atmospheric fog generator.",
+      "description": "Depth Anything V3 Small depth maps via depthcraft-cli (CPU or GPU), plus a lightweight plug-in for remapping, heatmap, fog layer, slicing and cutout.",
       "kind": "plugin",
       "abi": 1,
       "source": "plugins/depthcraft",

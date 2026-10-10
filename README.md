@@ -123,7 +123,7 @@ The browser-based LUT Studio is available at `https://akkk09.github.io/artcraft-
 | Plug-in | Type | What it does |
 |---|---|---|
 | **Chromatic Fringe** | Plugin (API v1) | Offsets red and blue color channels in opposite directions (`chromatic-fringe.wat`). |
-| **DepthCraft** | Plugin (API v1 / WASM) | Monocular depth estimation, edge-preserving bilateral filtering, and atmospheric fog generator (`depthcraft.wasm`). |
+| **DepthCraft** | Plugin (API v1 / WASM) + panels + CLI | AI depth maps (Depth Anything V3) for EffectCraft and After Effects via `DepthCraft-Windows.zip`; `depthcraft.wasm` colorizes, fogs, slices and cuts out the depth map. |
 | **EaseCraft** | Tool (ScriptUI / ExtendScript) | Visual cubic Bézier curve editor, transition presets, and keyframe easing tool (`EaseCraft.jsx`). |
 | **CaptionCraft** | Tool (ScriptUI / ExtendScript) | Caption authoring, SRT/VTT subtitle import/export, and typography layout tool (`CaptionCraft.jsx`). |
 | **QuietCraft** | Tool (ScriptUI / ExtendScript) | Automated audio silence detection, noise-floor thresholding, and speech derushing tool (`QuietCraft.jsx`). |

@@ -1,76 +1,86 @@
-//! Embedded zero-weights monocular depth estimator.
+//! Depth estimator interface plus the pure-Rust pre/post-processing shared by every backend.
 //!
-//! Uses multi-scale structure gradients, atmospheric haze cues, and perspective priors
-//! to synthesize an initial continuous depth map without requiring external neural network weights.
+//! The neural network itself (Depth Anything V3 Small, ONNX) lives in [`crate::onnx`] and is only
+//! compiled for the native CLI (`--features onnx`). Everything here is dependency-free and testable.
 
-pub fn estimate_depth_proxy(rgb: &[[f32; 3]], width: usize, height: usize, out: &mut [f32]) {
-    if width == 0 || height == 0 || rgb.len() < width * height || out.len() < width * height {
+/// ImageNet statistics used by the Depth Anything family.
+pub const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+pub const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
+
+/// ViT patch size; inference dimensions must be multiples of it.
+pub const PATCH: usize = 14;
+
+/// A monocular depth backend. Returns a `width * height` map normalised to `[0, 1]`
+/// where `0.0` is nearest and `1.0` is farthest.
+pub trait DepthEstimator {
+    fn id(&self) -> &str;
+    fn estimate(&mut self, rgb: &[[f32; 3]], width: usize, height: usize) -> Result<Vec<f32>, String>;
+}
+
+/// Inference size for an image: aspect preserved, long side ≈ `long_side`, both sides a multiple of [`PATCH`].
+pub fn inference_size(width: usize, height: usize, long_side: usize) -> (usize, usize) {
+    let long = width.max(height).max(1) as f32;
+    let scale = long_side as f32 / long;
+    let snap = |v: usize| (((v as f32 * scale) / PATCH as f32).round() as usize).max(1) * PATCH;
+    (snap(width), snap(height))
+}
+
+/// Bilinear resample of a single-channel plane.
+pub fn resize_plane(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f32> {
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 || src.len() < sw * sh {
+        return vec![0.0; dw * dh];
+    }
+    if sw == dw && sh == dh {
+        return src[..sw * sh].to_vec();
+    }
+    let mut out = vec![0.0f32; dw * dh];
+    let sx = sw as f32 / dw as f32;
+    let sy = sh as f32 / dh as f32;
+    for y in 0..dh {
+        let fy = ((y as f32 + 0.5) * sy - 0.5).clamp(0.0, (sh - 1) as f32);
+        let y0 = fy.floor() as usize;
+        let y1 = (y0 + 1).min(sh - 1);
+        let ty = fy - y0 as f32;
+        for x in 0..dw {
+            let fx = ((x as f32 + 0.5) * sx - 0.5).clamp(0.0, (sw - 1) as f32);
+            let x0 = fx.floor() as usize;
+            let x1 = (x0 + 1).min(sw - 1);
+            let tx = fx - x0 as f32;
+            let top = src[y0 * sw + x0] * (1.0 - tx) + src[y0 * sw + x1] * tx;
+            let bot = src[y1 * sw + x0] * (1.0 - tx) + src[y1 * sw + x1] * tx;
+            out[y * dw + x] = top * (1.0 - ty) + bot * ty;
+        }
+    }
+    out
+}
+
+/// Resize RGB to `dw x dh` and return a planar `[3, dh, dw]` tensor, ImageNet-normalised.
+pub fn to_nchw_normalized(rgb: &[[f32; 3]], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(3 * dw * dh);
+    for c in 0..3 {
+        let plane: Vec<f32> = rgb.iter().take(sw * sh).map(|p| p[c].clamp(0.0, 1.0)).collect();
+        let resized = resize_plane(&plane, sw, sh, dw, dh);
+        out.extend(resized.into_iter().map(|v| (v - IMAGENET_MEAN[c]) / IMAGENET_STD[c]));
+    }
+    out
+}
+
+/// Min–max normalise to `[0, 1]` (non-finite values become 0). A flat map becomes all zeros.
+pub fn normalize_depth(plane: &mut [f32]) {
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for v in plane.iter_mut() {
+        if !v.is_finite() {
+            *v = 0.0;
+        }
+        lo = lo.min(*v);
+        hi = hi.max(*v);
+    }
+    let span = hi - lo;
+    if !span.is_finite() || span < 1e-9 {
+        plane.fill(0.0);
         return;
     }
-
-    // Step 1: Compute luminance and saturation per pixel
-    let mut lum = vec![0.0f32; width * height];
-    let mut sat = vec![0.0f32; width * height];
-    for (i, c) in rgb.iter().take(width * height).enumerate() {
-        let (r, g, b) = (c[0], c[1], c[2]);
-        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        let max_c = r.max(g).max(b);
-        let min_c = r.min(g).min(b);
-        let s = if max_c > 1e-4 { (max_c - min_c) / max_c } else { 0.0 };
-
-        if let Some(target) = lum.get_mut(i) {
-            *target = y;
-        }
-        if let Some(target) = sat.get_mut(i) {
-            *target = s;
-        }
-    }
-
-    // Step 2: Multi-scale gradient magnitude (local sharpness/focus cue)
-    let inv_h = 1.0 / (height.max(1) as f32);
-
-    for y in 0..height {
-        let row_start = y * width;
-        let y_prev = if y > 0 { y - 1 } else { 0 };
-        let y_next = if y + 1 < height { y + 1 } else { y };
-        let row_prev = y_prev * width;
-        let row_next = y_next * width;
-
-        // Perspective prior: lower in frame is generally nearer (0.0 = near, 1.0 = far)
-        // Normalized vertical position: 0.0 at bottom, 1.0 at top
-        let vert_prior = 1.0 - ((y as f32) * inv_h);
-
-        for x in 0..width {
-            let idx = row_start + x;
-            let x_prev = if x > 0 { x - 1 } else { 0 };
-            let x_next = if x + 1 < width { x + 1 } else { x };
-
-            let l_c = lum.get(idx).copied().unwrap_or(0.0);
-            let s_c = sat.get(idx).copied().unwrap_or(0.0);
-
-            let l_l = lum.get(row_start + x_prev).copied().unwrap_or(l_c);
-            let l_r = lum.get(row_start + x_next).copied().unwrap_or(l_c);
-            let l_u = lum.get(row_prev + x).copied().unwrap_or(l_c);
-            let l_d = lum.get(row_next + x).copied().unwrap_or(l_c);
-
-            // Sobel / central difference gradient
-            let dx = (l_r - l_l) * 0.5;
-            let dy = (l_d - l_u) * 0.5;
-            let grad = (dx * dx + dy * dy).sqrt();
-
-            // Atmospheric perspective / haze prior:
-            // Distant objects lose saturation and shift towards atmospheric luminance
-            let haze_cue = (1.0 - s_c) * l_c;
-
-            // Sharp high-contrast edges cue: in-focus foreground has high sharpness
-            let sharpness_cue = (1.0 - (grad * 2.5).clamp(0.0, 1.0)).clamp(0.0, 1.0);
-
-            // Weighted combination of cues
-            let raw_depth = 0.55 * vert_prior + 0.25 * haze_cue + 0.20 * sharpness_cue;
-
-            if let Some(target) = out.get_mut(idx) {
-                *target = raw_depth.clamp(0.0, 1.0);
-            }
-        }
+    for v in plane.iter_mut() {
+        *v = (*v - lo) / span;
     }
 }

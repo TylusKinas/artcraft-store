@@ -4,9 +4,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::estimator::estimate_depth_proxy;
+use crate::estimator::DepthEstimator;
 use crate::filter::refine_depth_edges;
-use crate::models::{QualityPreset, sha256_hex};
+use crate::models::sha256_hex;
 
 /// Cancellation token allowing cooperative abortion of multi-frame batch processing.
 #[derive(Clone, Default)]
@@ -37,6 +37,17 @@ pub struct ProgressReport {
 }
 
 pub type ProgressCallback = Box<dyn FnMut(ProgressReport) + Send + Sync>;
+
+/// Blend `depth` towards the previous frame's map. `weight` is 0..100 (0 = off).
+pub fn blend_temporal(depth: &mut [f32], prev: &[f32], weight: f32) {
+    if weight <= 0.0 || prev.len() != depth.len() {
+        return;
+    }
+    let alpha = 1.0 - (weight.min(100.0) / 100.0 * 0.75);
+    for (c, p) in depth.iter_mut().zip(prev) {
+        *c = *c * alpha + *p * (1.0 - alpha);
+    }
+}
 
 /// In-memory LRU cache storing processed depth maps to prevent redundant re-inference.
 pub struct DepthCache {
@@ -84,8 +95,6 @@ impl DepthCache {
 
 /// Pipeline runner for single images or video sequences.
 pub struct PipelineConfig {
-    pub model_id: String,
-    pub quality: QualityPreset,
     pub edge_refine_radius: usize,
     pub temporal_smooth_weight: f32,
     pub memory_limit_bytes: usize,
@@ -94,8 +103,6 @@ pub struct PipelineConfig {
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
-            model_id: "classical".to_string(),
-            quality: QualityPreset::Balanced,
             edge_refine_radius: 2,
             temporal_smooth_weight: 50.0,
             memory_limit_bytes: 256 * 1024 * 1024, // 256 MB default
@@ -109,15 +116,32 @@ impl PipelineConfig {
     }
 }
 
-pub struct DepthPipeline {
+pub struct DepthPipeline<E: DepthEstimator> {
+    estimator: E,
     config: PipelineConfig,
     cache: DepthCache,
 }
 
-impl DepthPipeline {
-    pub fn new(config: PipelineConfig) -> Self {
+impl<E: DepthEstimator> DepthPipeline<E> {
+    pub fn new(estimator: E, config: PipelineConfig) -> Self {
         let max_mem = config.memory_limit_bytes;
-        Self { config, cache: DepthCache::new(max_mem) }
+        Self { estimator, config, cache: DepthCache::new(max_mem) }
+    }
+
+    pub fn estimator(&self) -> &E {
+        &self.estimator
+    }
+
+    pub fn estimator_mut(&mut self) -> &mut E {
+        &mut self.estimator
+    }
+
+    pub fn set_edge_refine(&mut self, radius: usize) {
+        self.config.edge_refine_radius = radius;
+    }
+
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
     }
 
     /// Compute frame content hash for cache lookup.
@@ -129,25 +153,24 @@ impl DepthPipeline {
             sample_bytes.push((c[2].clamp(0.0, 1.0) * 255.0) as u8);
         }
         let digest = sha256_hex(&sample_bytes);
-        format!("{}_{}x{}_{}_{}", self.config.model_id, width, height, self.config.edge_refine_radius, digest)
+        format!("{}_{}x{}_{}_{}", self.estimator.id(), width, height, self.config.edge_refine_radius, digest)
     }
 
     /// Process a single frame, returning depth map in [0, 1].
-    pub fn process_frame(&mut self, rgb: &[[f32; 3]], width: usize, height: usize) -> (Vec<f32>, bool) {
+    pub fn process_frame(&mut self, rgb: &[[f32; 3]], width: usize, height: usize) -> Result<(Vec<f32>, bool), String> {
         let key = self.compute_frame_key(rgb, width, height);
 
         if let Some(cached) = self.cache.get(&key) {
-            return (cached.clone(), true);
+            return Ok((cached.clone(), true));
         }
 
-        let mut raw = vec![0.0f32; width * height];
-        estimate_depth_proxy(rgb, width, height, &mut raw);
+        let raw = self.estimator.estimate(rgb, width, height)?;
 
         let mut refined = vec![0.0f32; width * height];
         refine_depth_edges(&raw, rgb, width, height, self.config.edge_refine_radius, &mut refined);
 
         self.cache.insert(key, refined.clone());
-        (refined, false)
+        Ok((refined, false))
     }
 
     /// Process a video frame sequence with progress reporting and cancellation support.
@@ -170,21 +193,10 @@ impl DepthPipeline {
                 return Err("processing cancelled by user".to_string());
             }
 
-            let (mut depth, hit) = self.process_frame(rgb, *w, *h);
+            let (mut depth, hit) = self.process_frame(rgb, *w, *h)?;
 
-            // Inter-frame temporal smoothing across sequence
-            if let Some(ref prev) = prev_depth
-                && prev.len() == depth.len()
-                && self.config.temporal_smooth_weight > 0.0
-            {
-                let alpha = 1.0 - (self.config.temporal_smooth_weight / 100.0 * 0.75);
-                for i in 0..depth.len() {
-                    let c = depth.get(i).copied().unwrap_or(0.0);
-                    let p = prev.get(i).copied().unwrap_or(0.0);
-                    if let Some(target) = depth.get_mut(i) {
-                        *target = c * alpha + p * (1.0 - alpha);
-                    }
-                }
+            if let Some(ref prev) = prev_depth {
+                blend_temporal(&mut depth, prev, self.config.temporal_smooth_weight);
             }
 
             prev_depth = Some(depth.clone());
