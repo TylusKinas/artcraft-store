@@ -25,7 +25,8 @@ WHAT IS IN THIS FOLDER
   Start-DepthCraft-Server.bat     EffectCraft only: starts the engine and keeps it ready (see below).
   depthcraft_server.py            The same server as one Python file (Windows/macOS/Linux): pip install onnxruntime
                                   numpy pillow, then python depthcraft_server.py. Use it instead of the .exe/.bat if you like.
-  EffectCraft\DepthCraft-EffectCraft.jsx   EffectCraft panel: "Render Depth" button.
+  EffectCraft\DepthCraft-EffectCraft.jsx   EffectCraft panel: "Start server" and "Render Depth" buttons. If you have Python, this
+                                           one file is enough: the panel starts the server for you (it is embedded).
   EffectCraft\depthcraft.wasm              EffectCraft effect: colorize / fog / slice / cutout a depth map.
   AfterEffects\DepthCraft-AfterEffects.jsx  Adobe After Effects panel (no server needed).
 

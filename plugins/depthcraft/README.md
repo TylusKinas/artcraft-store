@@ -2,13 +2,14 @@
 
 AI depth maps for **EffectCraft** and **Adobe After Effects**, powered by **Depth Anything V3 Small** (CPU, or GPU through DirectML).
 
-## Quick start (any OS, 3 files)
+## Quick start: one file
 
-1. `pip install onnxruntime numpy pillow` (GPU: `onnxruntime-directml` on Windows, `onnxruntime-gpu` for NVIDIA instead of `onnxruntime`)
-2. `python depthcraft_server.py` and leave it running (a single file; the 29 MB model is downloaded once and checked). Or without installing anything: `uv run depthcraft_server.py`.
-3. EffectCraft: Preferences ▸ Scripting & Expressions ▸ tick *Allow Scripts to Write Files and Access Network*, then File ▸ Scripts ▸ Install ScriptUI Panel… ▸ `DepthCraft-EffectCraft.jsx`; select a footage layer ▸ *From layer* ▸ *Render Depth*.
+1. EffectCraft: Preferences ▸ Scripting & Expressions ▸ tick *Allow Scripts to Write Files and Access Network* (and leave *Warn User When Executing Files* on: it asks once before opening the launcher).
+2. File ▸ Scripts ▸ Install ScriptUI Panel… ▸ [`DepthCraft-EffectCraft.jsx`](panels/DepthCraft-EffectCraft.jsx), then open **DepthCraft** from the Window menu.
+3. Press **Start server**. The panel writes the server (it is embedded in the file) and a launcher into the *Server folder*, and on Windows opens the launcher: a console window installs what is missing (Python packages and the 29 MB model, once; needs [Python 3](https://www.python.org/downloads/)) and keeps the server running. Leave it open. On macOS/Linux the panel shows the one command to paste into a terminal instead (EffectCraft can only "open" a file, which would show a `.py` in an editor there).
+4. Press **Check server** until it says OK, select a footage layer ▸ **From layer** ▸ **Render Depth**. The depth map is imported and added as a layer.
 
-Files: [`panels/depthcraft_server.py`](panels/depthcraft_server.py) + [`panels/DepthCraft-EffectCraft.jsx`](panels/DepthCraft-EffectCraft.jsx) (+ optional `depthcraft.wasm` for heatmap/fog/slice/cutout). No Python? **Windows users can download [`release/DepthCraft-Windows.zip`](release/DepthCraft-Windows.zip)** (exe with everything built in, panels, `README.txt`).
+*GPU* checkbox: installs `onnxruntime-directml` and starts the server with `--device gpu` (Windows, any DirectX 12 GPU). Optional: [`depthcraft.wasm`](depthcraft.wasm) (Effect ▸ Load Effect Plug-in…) for heatmap / fog / slice / cutout on the depth layer. No Python? **Windows users can download [`release/DepthCraft-Windows.zip`](release/DepthCraft-Windows.zip)** (exe with everything built in, panels, `README.txt`). The same server also runs by hand: `python depthcraft_server.py` (or `uv run depthcraft_server.py`), and as a command line: `python depthcraft_server.py depth photo.jpg --output out`.
 
 ## How it fits together
 
@@ -17,7 +18,7 @@ Files: [`panels/depthcraft_server.py`](panels/depthcraft_server.py) + [`panels/D
 | `depthcraft_server.py` | `panels/` | **Cross-platform server in one Python file** (ONNX Runtime; CPU or GPU). Also usable as a command line: `python depthcraft_server.py depth photo.jpg --output out`. |
 | `depthcraft-cli.exe` | zip | The same engine as a native Windows program. Model built in, ONNX Runtime + DirectML next to it. `depth` renders files/folders, `serve` keeps the model loaded for the EffectCraft panel. |
 | `Start-DepthCraft-Server.bat` | `panels/` | Starts `depthcraft-cli serve` (explained inside the file). Needed only for EffectCraft. |
-| `DepthCraft-EffectCraft.jsx` | `panels/` | EffectCraft panel (Render Depth button, progress bar), talks to the server over `127.0.0.1:47831`. |
+| `DepthCraft-EffectCraft.jsx` | `panels/` | **The one file to install** in EffectCraft: Start server / Render Depth buttons, progress bar; embeds `depthcraft_server.py` (`python3 scripts/embed_server.py` refreshes it) and talks to it over `127.0.0.1:47831`. |
 | `DepthCraft-AfterEffects.jsx` | `panels/` | Adobe After Effects panel; runs the CLI directly (experimental, untested in Adobe's app). |
 | `depthcraft.wasm` (37 KB) | root | EffectCraft effect (Effect ▸ Stylize ▸ DepthCraft): near/far remap, gamma, invert, **Grayscale / Heatmap / Fog Layer / Depth Slice / Depth Cutout** on a depth-map layer. |
 
